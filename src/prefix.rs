@@ -398,159 +398,168 @@ impl PrefixIndex {
         query,
         k = 100,
     ))]
-    pub fn find_matches(&self, query: &str, k: usize) -> anyhow::Result<Vec<(usize, f32, usize)>> {
-        let start = Instant::now();
+    pub fn find_matches(
+        &self,
+        py: Python,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<(usize, f32, usize)>> {
+        py.detach(|| {
+            let start = Instant::now();
 
-        // scale k by facotr of avg. ids per indexed item
-        // add factor of 2 to be safe
-        let k_factor = self.id_to_index.len() as f32 / self.data.len() as f32;
-        let k_scaled = (k as f32 * k_factor * 2.0).ceil() as usize;
+            // scale k by facotr of avg. ids per indexed item
+            // add factor of 2 to be safe
+            let k_factor = self.id_to_index.len() as f32 / self.data.len() as f32;
+            let k_scaled = (k as f32 * k_factor * 2.0).ceil() as usize;
 
-        let query = normalize(query);
-        let keywords: Vec<_> = query.split_whitespace().collect();
-        let num_keywords = keywords.len();
+            let query = normalize(query);
+            let keywords: Vec<_> = query.split_whitespace().collect();
+            let num_keywords = keywords.len();
 
-        let mut items: HashMap<u32, Item> = HashMap::new();
+            let mut items: HashMap<u32, Item> = HashMap::new();
 
-        let keyword_matches: Vec<_> = keywords
-            .iter()
-            .map(|kw| self.get_matches(kw))
-            // most selective first
-            .sorted_by_cached_key(|inv_lists| {
-                inv_lists
-                    .iter()
-                    .map(|inv_list| inv_list.length)
-                    .sum::<usize>()
-            })
-            .collect();
+            let keyword_matches: Vec<_> = keywords
+                .iter()
+                .map(|kw| self.get_matches(kw))
+                // most selective first
+                .sorted_by_cached_key(|inv_lists| {
+                    inv_lists
+                        .iter()
+                        .map(|inv_list| inv_list.length)
+                        .sum::<usize>()
+                })
+                .collect();
 
-        debug!(
-            "Getting matches took {:.2}ms",
-            start.elapsed().as_secs_f32() * 1000.0
-        );
+            debug!(
+                "Getting matches took {:.2}ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
 
-        let mut top_k: BTreeSet<Candidate> = BTreeSet::new();
+            let mut top_k: BTreeSet<Candidate> = BTreeSet::new();
 
-        let worst_candidate = |top_k: &BTreeSet<_>| -> Option<Candidate> {
-            if top_k.len() == k_scaled {
-                top_k.first().copied()
-            } else if top_k.len() > k_scaled {
-                panic!("top_k has more than k elements, should not happen");
-            } else {
-                None
-            }
-        };
+            let worst_candidate = |top_k: &BTreeSet<_>| -> Option<Candidate> {
+                if top_k.len() == k_scaled {
+                    top_k.first().copied()
+                } else if top_k.len() > k_scaled {
+                    panic!("top_k has more than k elements, should not happen");
+                } else {
+                    None
+                }
+            };
 
-        let mut skip = HashSet::new();
+            let mut skip = HashSet::new();
 
-        for (keyword, inv_lists) in keyword_matches.into_iter().enumerate() {
-            let keywords_left = num_keywords - keyword - 1;
-            let max_future_score = Item::ES * keywords_left as f32;
+            for (keyword, inv_lists) in keyword_matches.into_iter().enumerate() {
+                let keywords_left = num_keywords - keyword - 1;
+                let max_future_score = Item::ES * keywords_left as f32;
 
-            for inv_list in inv_lists {
-                let mut last_id = None;
-                let mut occurrence = 0;
-                for &id in inv_list.parse()? {
-                    if skip.contains(&id) {
-                        continue;
-                    }
-
-                    if Some(id) == last_id {
-                        occurrence += 1;
-                    } else {
-                        occurrence = 0;
-                    }
-                    last_id = Some(id);
-
-                    let index = self.id_to_index[id as usize];
-                    if let Some(sub_index) = self.sub_index.as_ref() {
-                        if !sub_index.contains(&index) {
+                for inv_list in inv_lists {
+                    let mut last_id = None;
+                    let mut occurrence = 0;
+                    for &id in inv_list.parse()? {
+                        if skip.contains(&id) {
                             continue;
                         }
-                    };
 
-                    let length = self.lengths[id as usize];
-
-                    // update item and get current score
-                    let mut entry = items.entry(id);
-                    let item = match entry {
-                        Entry::Occupied(ref mut entry) => entry.get_mut(),
-                        Entry::Vacant(entry) => {
-                            if let Some(worst) = worst_candidate(&top_k) {
-                                // compute an upper bound score for this newly matched id:
-                                // 1. assume all future keywords match exactly
-                                // 2. add current score for exact or prefix match
-                                // 3. subtract penalty for all previous keywords missed
-                                // TODO: currently ignores length of doc (potential word penalty or
-                                // fewer future matches), maybe add that too?
-                                let mut upper_bound_score = max_future_score;
-                                upper_bound_score +=
-                                    if inv_list.exact { Item::ES } else { Item::PS };
-                                upper_bound_score -= keyword as f32 * Item::KP;
-
-                                let upper_bound = Candidate::new(id, upper_bound_score, index);
-                                if upper_bound <= worst {
-                                    // even the upper bound is not enough to enter the top k
-                                    skip.insert(id);
-                                    continue;
-                                }
-                            }
-                            entry.insert(Item::new())
+                        if Some(id) == last_id {
+                            occurrence += 1;
+                        } else {
+                            occurrence = 0;
                         }
-                    };
-                    item.update(inv_list.word, occurrence, keyword, inv_list.exact);
-                    let current = item.candidate(id, index, num_keywords, length);
-                    let old = item.candidate.replace(current);
-                    if let Some(old) = old {
-                        // remove old candidate from top_k, might not be present
-                        top_k.remove(&old);
-                    }
+                        last_id = Some(id);
 
-                    let Some(worst) = worst_candidate(&top_k) else {
-                        // top_k not full yet, just insert
-                        top_k.insert(current);
-                        continue;
-                    };
+                        let index = self.id_to_index[id as usize];
+                        if let Some(sub_index) = self.sub_index.as_ref() {
+                            if !sub_index.contains(&index) {
+                                continue;
+                            }
+                        };
 
-                    // upper bound for current candidate if all future keywords match exactly
-                    let upper_bound = current.add(max_future_score);
-                    if upper_bound <= worst {
-                        // even in the best case this item cannot enter the top k
-                        skip.insert(id);
-                        continue;
-                    }
+                        let length = self.lengths[id as usize];
 
-                    if current > worst {
-                        // better than the worst in top_k, insert
-                        top_k.pop_first();
-                        top_k.insert(current);
+                        // update item and get current score
+                        let mut entry = items.entry(id);
+                        let item = match entry {
+                            Entry::Occupied(ref mut entry) => entry.get_mut(),
+                            Entry::Vacant(entry) => {
+                                if let Some(worst) = worst_candidate(&top_k) {
+                                    // compute an upper bound score for this newly matched id:
+                                    // 1. assume all future keywords match exactly
+                                    // 2. add current score for exact or prefix match
+                                    // 3. subtract penalty for all previous keywords missed
+                                    // TODO: currently ignores length of doc (potential word penalty or
+                                    // fewer future matches), maybe add that too?
+                                    let mut upper_bound_score = max_future_score;
+                                    upper_bound_score +=
+                                        if inv_list.exact { Item::ES } else { Item::PS };
+                                    upper_bound_score -= keyword as f32 * Item::KP;
+
+                                    let upper_bound = Candidate::new(id, upper_bound_score, index);
+                                    if upper_bound <= worst {
+                                        // even the upper bound is not enough to enter the top k
+                                        skip.insert(id);
+                                        continue;
+                                    }
+                                }
+                                entry.insert(Item::new())
+                            }
+                        };
+                        item.update(inv_list.word, occurrence, keyword, inv_list.exact);
+                        let current = item.candidate(id, index, num_keywords, length);
+                        let old = item.candidate.replace(current);
+                        if let Some(old) = old {
+                            // remove old candidate from top_k, might not be present
+                            top_k.remove(&old);
+                        }
+
+                        let Some(worst) = worst_candidate(&top_k) else {
+                            // top_k not full yet, just insert
+                            top_k.insert(current);
+                            continue;
+                        };
+
+                        // upper bound for current candidate if all future keywords match exactly
+                        let upper_bound = current.add(max_future_score);
+                        if upper_bound <= worst {
+                            // even in the best case this item cannot enter the top k
+                            skip.insert(id);
+                            continue;
+                        }
+
+                        if current > worst {
+                            // better than the worst in top_k, insert
+                            top_k.pop_first();
+                            top_k.insert(current);
+                        }
                     }
                 }
             }
-        }
 
-        let matches: Vec<_> = top_k
-            .into_iter()
-            .sorted_by_key(|&candidate| (candidate.index, Reverse(candidate.score), candidate.id))
-            .dedup_by(|a, b| a.index == b.index)
-            .sorted_by_key(|&candidate| (Reverse(candidate.score), candidate.index))
-            .take(k)
-            .map(|candidate| {
-                (
-                    candidate.index,
-                    candidate.score.into_inner(),
-                    self.get_column_for_id(candidate.id),
-                )
-            })
-            .collect();
+            let matches: Vec<_> = top_k
+                .into_iter()
+                .sorted_by_key(|&candidate| {
+                    (candidate.index, Reverse(candidate.score), candidate.id)
+                })
+                .dedup_by(|a, b| a.index == b.index)
+                .sorted_by_key(|&candidate| (Reverse(candidate.score), candidate.index))
+                .take(k)
+                .map(|candidate| {
+                    (
+                        candidate.index,
+                        candidate.score.into_inner(),
+                        self.get_column_for_id(candidate.id),
+                    )
+                })
+                .collect();
 
-        debug!(
-            "Got top {} matches for query '{query}' in {:.2}ms",
-            matches.len(),
-            start.elapsed().as_secs_f32() * 1000.0
-        );
+            debug!(
+                "Got top {} matches for query '{query}' in {:.2}ms",
+                matches.len(),
+                start.elapsed().as_secs_f32() * 1000.0
+            );
 
-        Ok(matches)
+            Ok(matches)
+        })
     }
 
     pub fn get_type(&self) -> &str {
