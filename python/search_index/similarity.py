@@ -7,6 +7,7 @@ from typing import Any, Iterator
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import torch
 from tqdm import tqdm, trange
 from sortedcontainers import SortedSet
 
@@ -343,6 +344,10 @@ class SimilarityIndex(SearchIndex):
             index = faiss.read_index(index_file)
         else:
             index = faiss.read_index_binary(index_file)
+
+        if not torch.cuda.is_available():
+            # for inference, fall back to CPU if no GPU is available
+            device = "cpu"
 
         if model is None or not model.same_as(config["model"]):
             model = EmbeddingModel(model=config["model"], device=device)
