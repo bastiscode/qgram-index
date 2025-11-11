@@ -211,6 +211,10 @@ class SimilarityIndex(SearchIndex):
         if model is None:
             model = "Qwen/Qwen3-Embedding-0.6B"
 
+        if not torch.cuda.is_available():
+            # for building, fall back to CPU if no GPU is available
+            device = "cpu"
+
         emb_model = EmbeddingModel(model, device)
 
         if precision == "float32":
